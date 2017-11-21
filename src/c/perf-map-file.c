@@ -22,7 +22,9 @@
 #include <stdio.h>
 
 #ifdef __APPLE__
+
 #include <stdlib.h>
+
 #else
 #include <error.h>
 #endif
@@ -31,10 +33,10 @@
 
 #include "perf-map-file.h"
 
-FILE *perf_map_open(pid_t pid) {
+FILE *_map_file_open(pid_t pid, const char *name_suffix) {
     char filename[500];
-    snprintf(filename, sizeof(filename), "/tmp/perf-%d.map", pid);
-    FILE * res = fopen(filename, "w");
+    snprintf(filename, sizeof(filename), "/tmp/perf-%d%s.map", pid, name_suffix);
+    FILE *res = fopen(filename, "w");
     if (!res) {
 #ifdef __APPLE__
         fprintf(stderr, "Couldn't open %s: errno(%d)", filename, errno);
@@ -46,6 +48,10 @@ FILE *perf_map_open(pid_t pid) {
     return res;
 }
 
+FILE *perf_map_open(pid_t pid) {
+    return _map_file_open(pid, "");
+}
+
 int perf_map_close(FILE *fp) {
     if (fp)
         return fclose(fp);
@@ -53,7 +59,20 @@ int perf_map_close(FILE *fp) {
         return 0;
 }
 
-void perf_map_write_entry(FILE *method_file, const void* code_addr, unsigned int code_size, const char* entry) {
-    if (method_file)
+void perf_map_write_entry(FILE *method_file, const void *code_addr, unsigned int code_size, const char *entry) {
+    if (method_file) {
         fprintf(method_file, "%lx %x %s\n", (unsigned long) code_addr, code_size, entry);
+        fflush(method_file);
+    }
+}
+
+FILE *perf_thread_map_open(pid_t pid) {
+    return _map_file_open(pid, "-thread");
+}
+
+void perf_thread_man_write_entry(FILE *thread_file, const uint64_t pthread_tid, const char* jvm_thread_name) {
+    if (thread_file) {
+        fprintf(thread_file, "%llu %s\n", pthread_tid, jvm_thread_name);
+        fflush(thread_file);
+    }
 }

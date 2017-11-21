@@ -22,4 +22,5 @@ FILE *perf_map_open(pid_t pid);
 int perf_map_close(FILE *fp);
 void perf_map_write_entry(FILE *method_file, const void* code_addr, unsigned int code_size, const char* entry);
 
-
+FILE *perf_thread_map_open(pid_t pid);
+void perf_thread_man_write_entry(FILE *thread_file, const uint64_t pthread_tid, const char* jvm_thread_name);

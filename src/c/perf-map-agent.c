@@ -28,6 +28,10 @@
 #include <jni.h>
 #include <jvmti.h>
 #include <jvmticmlr.h>
+#include <pthread.h>
+
+#include <mach/mach.h>
+#include <stdlib.h>
 
 #include "perf-map-file.h"
 
@@ -43,28 +47,43 @@ bool clean_class_names = false;
 bool debug_dump_unfold_entries = false;
 
 FILE *method_file = NULL;
+FILE *thread_file = NULL;
+
+static const int _thread_osthread_offset = 296;
+static const int _osthread_id_offset = 96;
+
+int os_thread_id(const void *vm_thread) {
+    const char *os_thread = *(const char **) (((const char *) vm_thread) + _thread_osthread_offset);
+    return *(int *) (os_thread + _osthread_id_offset);
+}
+
 void open_map_file() {
     if (!method_file)
         method_file = perf_map_open(getpid());
+    if (!thread_file)
+        thread_file = perf_thread_map_open(getpid());
 }
+
 void close_map_file() {
     perf_map_close(method_file);
     method_file = NULL;
+    perf_map_close(thread_file);
+    thread_file = NULL;
 }
 
 static int get_line_number(jvmtiLineNumberEntry *table, jint entry_count, jlocation loc) {
-  int i;
-  for (i = 0; i < entry_count; i++)
-    if (table[i].start_location > loc) return table[i - 1].line_number;
+    int i;
+    for (i = 0; i < entry_count; i++)
+        if (table[i].start_location > loc) return table[i - 1].line_number;
 
-  return -1;
+    return -1;
 }
 
 void class_name_from_sig(char *dest, size_t dest_size, const char *sig) {
     if (clean_class_names && sig[0] == 'L') {
         const char *src = sig + 1;
         int i;
-        for(i = 0; i < (dest_size - 1) && src[i]; i++) {
+        for (i = 0; i < (dest_size - 1) && src[i]; i++) {
             char c = src[i];
             if (c == '/') c = '.';
             if (c == ';') c = 0;
@@ -100,7 +119,7 @@ static void sig_string(jvmtiEnv *jvmti, jmethodID method, char *output, size_t n
                 if (!(*jvmti)->GetSourceFileName(jvmti, class, &sourcefile)) {
                     if (!(*jvmti)->GetLineNumberTable(jvmti, method, &entrycount, &lines)) {
                         int lineno = -1;
-                        if(entrycount > 0) lineno = lines[0].line_number;
+                        if (entrycount > 0) lineno = lines[0].line_number;
                         snprintf(source_info, sizeof(source_info), "(%s:%d)", sourcefile, lineno);
 
                         if (lines != NULL) (*jvmti)->Deallocate(jvmti, (unsigned char *) lines);
@@ -130,7 +149,8 @@ void generate_single_entry(jvmtiEnv *jvmti, jmethodID method, const void *code_a
 }
 
 /* Generates either a simple or a complex unfolded entry. */
-void generate_unfolded_entry(jvmtiEnv *jvmti, jmethodID method, char *buffer, size_t buffer_size, const char *root_name) {
+void
+generate_unfolded_entry(jvmtiEnv *jvmti, jmethodID method, char *buffer, size_t buffer_size, const char *root_name) {
     if (unfold_simple)
         sig_string(jvmti, method, buffer, buffer_size);
     else {
@@ -179,10 +199,10 @@ void dump_entries(
         jvmtiEnv *jvmti,
         jmethodID root_method,
         jint code_size,
-        const void* code_addr,
+        const void *code_addr,
         jint map_length,
-        const jvmtiAddrLocationMap* map,
-        const void* compile_info) {
+        const jvmtiAddrLocationMap *map,
+        const void *compile_info) {
     const jvmtiCompiledMethodLoadRecordHeader *header = compile_info;
     char root_name[STRING_BUFFER_SIZE];
     sig_string(jvmti, root_method, root_name, sizeof(root_name));
@@ -210,10 +230,10 @@ void generate_unfolded_entries(
         jvmtiEnv *jvmti,
         jmethodID root_method,
         jint code_size,
-        const void* code_addr,
+        const void *code_addr,
         jint map_length,
-        const jvmtiAddrLocationMap* map,
-        const void* compile_info) {
+        const jvmtiAddrLocationMap *map,
+        const void *compile_info) {
     const jvmtiCompiledMethodLoadRecordHeader *header = compile_info;
     char root_name[STRING_BUFFER_SIZE];
 
@@ -266,45 +286,181 @@ void generate_unfolded_entries(
 
 static void JNICALL
 cbCompiledMethodLoad(
-            jvmtiEnv *jvmti,
-            jmethodID method,
-            jint code_size,
-            const void* code_addr,
-            jint map_length,
-            const jvmtiAddrLocationMap* map,
-            const void* compile_info) {
+        jvmtiEnv *jvmti,
+        jmethodID method,
+        jint code_size,
+        const void *code_addr,
+        jint map_length,
+        const jvmtiAddrLocationMap *map,
+        const void *compile_info) {
+    printf("cbCompiledMethodLoad\n");
     if (unfold_inlined_methods && compile_info != NULL)
-        generate_unfolded_entries(jvmti, method, code_size, code_addr, map_length, map, compile_info); 
+        generate_unfolded_entries(jvmti, method, code_size, code_addr, map_length, map, compile_info);
     else
         generate_single_entry(jvmti, method, code_addr, code_size);
 }
 
 void JNICALL
 cbDynamicCodeGenerated(jvmtiEnv *jvmti,
-            const char* name,
-            const void* address,
-            jint length) {
+                       const char *name,
+                       const void *address,
+                       jint length) {
+    printf("cbDynamicCodeGenerated %s %lx\n", name, (unsigned long) address);
     perf_map_write_entry(method_file, address, length, name);
+}
+
+static JavaVM *_vm;
+//static jvmtiEnv *_jvmti;
+
+static JNIEnv *get_JNI() { //one per thread
+    JNIEnv *jni;
+    (*_vm)->GetEnv(_vm, (void **) &jni, JNI_VERSION_1_6) == 0 ? jni : NULL;
+    return jni;
+}
+
+jvmtiThreadInfo get_thread_info(jvmtiEnv *jvmti, jthread thread) {
+    jvmtiThreadInfo info1;
+    /* Make sure the stack variables are garbage free */
+    (void) memset(&info1, 0, sizeof(info1));
+    jvmtiError err = (*jvmti)->GetThreadInfo(jvmti, thread, &info1);
+    if (err != JVMTI_ERROR_NONE) {
+        printf("(GetThreadInfo) Error expected: %d, got: %d\n", JVMTI_ERROR_NONE, err);
+        printf("\n");
+    }
+    return info1;
+}
+
+void print_thread_info(jvmtiThreadInfo info, uint64_t os_tid) {
+    printf("Running Thread: %s, native id: %llu, Priority: %d, context class loader:%s\n", info.name, os_tid,
+           info.priority, (info.context_class_loader == NULL ? ": NULL" : "Not Null"));
+}
+
+static int get_pthreads(pthread_t** threads) {
+    mach_msg_type_number_t count;
+    thread_act_array_t list;
+    task_threads(mach_task_self(), &list, &count);
+    printf("get_pthreads: threads count = %d\n", count);
+    *threads = malloc(sizeof(pthread_t) * count);
+    for (int i = 0; i < count; i++) {
+        (*threads)[i] = pthread_from_mach_thread_np(list[i]);
+    }
+    return count;
+}
+
+static void print_all_pthreads() {
+    pthread_t* threads;
+    int count = get_pthreads(&threads);
+    printf("pthreads count = %d\n", count);
+    for (int i = 0; i < count; i++) {
+        char name[256];
+        name[0] = '\0';
+        printf("threads: %p", threads);
+        int rc = pthread_getname_np(threads[i], name, sizeof(name));
+        printf("rc = %d ", rc);
+        int pthread_mach_thread_np_res = pthread_mach_thread_np(threads[i]);
+        uint64_t pthread_tid;
+        pthread_threadid_np(threads[i], &pthread_tid);
+        printf("name: %s, pthread_id(native): %llu, pthread_mach_thread_np_res: 0x%x\n", name, pthread_tid, pthread_mach_thread_np_res);
+    }
+
+}
+
+static int getThreadsCount() {
+    thread_array_t threadList;
+    mach_msg_type_number_t threadCount;
+    task_t task;
+
+    kern_return_t kernReturn = task_for_pid(mach_task_self(), getpid(), &task);
+    if (kernReturn != KERN_SUCCESS) {
+        return -1;
+    }
+
+    kernReturn = task_threads(task, &threadList, &threadCount);
+    if (kernReturn != KERN_SUCCESS) {
+        return -1;
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t) threadList, threadCount * sizeof(thread_act_t));
+
+    return threadCount;
+}
+
+void print_thread_name_and_osid(jvmtiEnv *jvmti, jthread thread) {
+    jvmtiThreadInfo info1 = get_thread_info(jvmti, thread);
+    JNIEnv *env = get_JNI();
+    jclass threadClass = (*env)->FindClass(env, "java/lang/Thread");
+    if (threadClass == NULL) {
+        printf("can't find class java/lang/Thread");
+        return;
+    }
+    jfieldID eetop = (*env)->GetFieldID(env, threadClass, "eetop", "J");
+    if (eetop == NULL) {
+        printf("can't find field eetop");
+        return;
+    }
+
+    const void *vm_thread = (const void *) (uintptr_t) (*env)->GetLongField(env, thread, eetop);
+    int os_id_from_vm_thread = os_thread_id(vm_thread);
+
+    int pthread_mach_thread_np_res = pthread_mach_thread_np(pthread_self());
+
+    uint64_t pthread_tid;
+    //uint64_t pthread_self_res = (uint64_t) pthread_self()->__sig;
+    pthread_threadid_np(NULL, &pthread_tid);
+    printf("DEBUG: thread: %s, pthread_id(native): %llu, os_id_from_vm_thread: 0x%x, pthread_mach_thread_np_res, 0x%x\n",
+           info1.name, pthread_tid, os_id_from_vm_thread, pthread_mach_thread_np_res);
+    printf("getThreadsCount() = %d\n", getThreadsCount());
+    //print_thread_info(info1, pthread_tid);
+
+    perf_thread_man_write_entry(thread_file, pthread_tid, info1.name);
+
+    jvmtiError err = (*jvmti)->Deallocate(jvmti, (void *) info1.name);
+    if (err != JVMTI_ERROR_NONE) {
+        printf("(GetThreadInfo) Error expected: %d, got: %d\n", JVMTI_ERROR_NONE, err);
+        printf("\n");
+    }
+}
+
+void print_all_threads(jvmtiEnv *jvmti) {
+    printf("print_all_threads()\n");
+    jint thr_count = -1;
+    jthread *thr_ptr = NULL;
+    (*jvmti)->GetAllThreads(jvmti, &thr_count, &thr_ptr);
+    printf("Thread Count: %d\n", thr_count);
+
+    for (int i = 0; i < thr_count; i++) {
+        print_thread_name_and_osid(jvmti, thr_ptr[i]);
+    }
+}
+
+void JNICALL
+cbThreadStart(jvmtiEnv *jvmti_env,
+              JNIEnv *jni_env,
+              jthread thread) {
+    printf("cbThreadStart: ");
+    print_thread_name_and_osid(jvmti_env, thread);
+    print_all_pthreads();
+    //print_all_threads(jvmti_env);
 }
 
 void set_notification_mode(jvmtiEnv *jvmti, jvmtiEventMode mode) {
     (*jvmti)->SetEventNotificationMode(jvmti, mode,
-          JVMTI_EVENT_COMPILED_METHOD_LOAD, (jthread)NULL);
+                                       JVMTI_EVENT_COMPILED_METHOD_LOAD, (jthread) NULL);
     (*jvmti)->SetEventNotificationMode(jvmti, mode,
-          JVMTI_EVENT_DYNAMIC_CODE_GENERATED, (jthread)NULL);
+                                       JVMTI_EVENT_DYNAMIC_CODE_GENERATED, (jthread) NULL);
 }
 
 jvmtiError enable_capabilities(jvmtiEnv *jvmti) {
     jvmtiCapabilities capabilities;
 
-    memset(&capabilities,0, sizeof(capabilities));
-    capabilities.can_generate_all_class_hook_events  = 1;
-    capabilities.can_tag_objects                     = 1;
-    capabilities.can_generate_object_free_events     = 1;
-    capabilities.can_get_source_file_name            = 1;
-    capabilities.can_get_line_numbers                = 1;
+    memset(&capabilities, 0, sizeof(capabilities));
+    capabilities.can_generate_all_class_hook_events = 1;
+    capabilities.can_tag_objects = 1;
+    capabilities.can_generate_object_free_events = 1;
+    capabilities.can_get_source_file_name = 1;
+    capabilities.can_get_line_numbers = 1;
     capabilities.can_generate_vm_object_alloc_events = 1;
     capabilities.can_generate_compiled_method_load_events = 1;
+    capabilities.can_signal_thread = 1;
 
     // Request these capabilities for this JVM TI environment.
     return (*jvmti)->AddCapabilities(jvmti, &capabilities);
@@ -314,15 +470,21 @@ jvmtiError set_callbacks(jvmtiEnv *jvmti) {
     jvmtiEventCallbacks callbacks;
 
     memset(&callbacks, 0, sizeof(callbacks));
-    callbacks.CompiledMethodLoad  = &cbCompiledMethodLoad;
+    callbacks.CompiledMethodLoad = &cbCompiledMethodLoad;
     callbacks.DynamicCodeGenerated = &cbDynamicCodeGenerated;
-    return (*jvmti)->SetEventCallbacks(jvmti, &callbacks, (jint)sizeof(callbacks));
+    callbacks.ThreadStart = &cbThreadStart;
+    return (*jvmti)->SetEventCallbacks(jvmti, &callbacks, (jint) sizeof(callbacks));
 }
 
-JNIEXPORT jint JNICALL
-Agent_OnAttach(JavaVM *vm, char *options, void *reserved) {
-    open_map_file();
 
+static void parse_cmd_params(char *options) {
+    if (options == NULL) {
+        unfold_simple = true;
+        unfold_all = true;
+        unfold_inlined_methods = true;
+        debug_dump_unfold_entries = true;
+        return;
+    }
     unfold_simple = strstr(options, "unfoldsimple") != NULL;
     unfold_all = strstr(options, "unfoldall") != NULL;
     unfold_inlined_methods = strstr(options, "unfold") != NULL || unfold_simple || unfold_all;
@@ -330,17 +492,44 @@ Agent_OnAttach(JavaVM *vm, char *options, void *reserved) {
     print_source_loc = strstr(options, "sourcepos") != NULL;
     clean_class_names = strstr(options, "dottedclass") != NULL;
     debug_dump_unfold_entries = strstr(options, "debug_dump_unfold_entries") != NULL;
+}
 
+static void agent_main(JavaVM *vm, char *options, void *reserved) {
+    _vm = vm;
+    open_map_file();
+    printf("map file opened\n");
+    parse_cmd_params(options);
+    printf("cmd params parsed\n");
+    unfold_simple = true;
+    unfold_all = true;
+    unfold_inlined_methods = true;
     jvmtiEnv *jvmti;
-    (*vm)->GetEnv(vm, (void **)&jvmti, JVMTI_VERSION_1);
+    (*vm)->GetEnv(vm, (void **) &jvmti, JVMTI_VERSION_1);
     enable_capabilities(jvmti);
+    printf("capabilities enabled\n");
     set_callbacks(jvmti);
+    printf("callbacks set\n");
+    print_all_threads(jvmti);
+    print_all_pthreads();
     set_notification_mode(jvmti, JVMTI_ENABLE);
+    (*jvmti)->SetEventNotificationMode(jvmti, JVMTI_ENABLE, JVMTI_EVENT_THREAD_START, NULL);
     (*jvmti)->GenerateEvents(jvmti, JVMTI_EVENT_DYNAMIC_CODE_GENERATED);
     (*jvmti)->GenerateEvents(jvmti, JVMTI_EVENT_COMPILED_METHOD_LOAD);
     set_notification_mode(jvmti, JVMTI_DISABLE);
-    close_map_file();
+}
 
+JNIEXPORT jint JNICALL
+Agent_OnLoad(JavaVM *vm, char *options, void *reserved) {
+    printf("Agent_OnLoad\n");
+    agent_main(vm, options, reserved);
+    return 0;
+}
+
+JNIEXPORT jint JNICALL
+Agent_OnAttach(JavaVM *vm, char *options, void *reserved) {
+    printf("Agent_OnAttach\n");
+    agent_main(vm, options, reserved);
+    close_map_file(); //FIXME
     return 0;
 }
 
